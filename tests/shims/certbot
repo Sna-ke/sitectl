@@ -1,0 +1,8 @@
+#!/bin/sh
+# Test stand-in for certbot: runs the real certbot, but logs each call
+# and points it at an address where no Let's Encrypt server is listening,
+# so tests can never request a real certificate.
+echo "$1" >> /tmp/sitectl-test/certbot-calls.log
+exec "${CERTBOT_REAL:-/usr/bin/certbot}" "$@" --server https://127.0.0.1:9/directory \
+  --config-dir /tmp/sitectl-test/letsencrypt --work-dir /tmp/sitectl-test/le-work \
+  --logs-dir /tmp/sitectl-test/le-logs

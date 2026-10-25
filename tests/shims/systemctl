@@ -1,0 +1,11 @@
+#!/bin/sh
+# Test stand-in for systemctl, for containers without systemd: reloads
+# nginx and PHP-FPM directly, and accepts everything else.
+case "$*" in
+  *nginx*) nginx -s reload 2> /dev/null || nginx; sleep 1 ;;
+  *fpm*)   pid=$(cat /run/php/php*-fpm.pid 2> /dev/null | head -n 1)
+           [ -n "$pid" ] && kill -USR2 "$pid" ;;
+  *ssh*)   pid=$(cat /run/sshd-sitectl-test.pid 2> /dev/null)
+           [ -n "$pid" ] && kill -HUP "$pid" ;;
+esac
+exit 0

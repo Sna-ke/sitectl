@@ -1,0 +1,455 @@
+#!/usr/bin/env bash
+#
+# =============================================================================
+#  sitectl: set up and manage websites on this server
+# =============================================================================
+#
+#  sudo sitectl add example.com                      add a site (or redeploy it)
+#  sudo sitectl add-subdomain example.com demo       add demo.example.com
+#  sudo sitectl remove example.com                   remove a site's configs
+#  sudo sitectl remove-subdomain example.com demo    remove demo.example.com
+#  sitectl list [example.com] [--json]               list sites
+#  sudo sitectl config                               change the default settings
+#  sitectl help                                      everything else
+#
+#  This file reads the command line and runs the steps in order. The work
+#  itself is in the library files in /usr/local/lib/sitectl, one per area
+#  (users and folders, PHP, nginx, certificates, ...), and in modules
+#  (SFTP, and more to come), each a package of its own.
+#
+#  The README has the full picture: the folder layout, how certificates
+#  and SFTP work, moving sites from another server, and installing.
+#
+# =============================================================================
+
+# Stop immediately if any command fails, if an unset variable is used,
+# or if any command in a pipeline fails. -E makes the error message
+# below work inside functions too.
+set -Eeuo pipefail
+
+# If something does fail, say where, so it's easy to find. (Inside a
+# function, BASH_LINENO holds the right line number; at the top level
+# it's 0 and LINENO is right instead.)
+# Exit status 141 is a closed pipe (sitectl list | head): not an error, so
+# it stops quietly.
+trap 'status=$?; (( status == 141 )) && exit 141; echo "!! Failed at ${BASH_SOURCE[1]:-${BASH_SOURCE[0]}} line $(( ${BASH_LINENO[0]:-0} > 0 ? ${BASH_LINENO[0]:-0} : LINENO )): $BASH_COMMAND" >&2' ERR
+
+SITECTL_VERSION="0.3.0"
+
+# The library files: next to this file when run from a copy of the
+# project (for development and the tests), otherwise where install.sh
+# put them.
+if [[ -z "${SITECTL_LIB:-}" ]]; then
+  SITECTL_LIB="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)/lib"
+  [[ -f "$SITECTL_LIB/ui.sh" ]] || SITECTL_LIB="/usr/local/lib/sitectl"
+fi
+
+for library in ui settings sites subdomains users php nginx certs summary \
+               redeploy remove list log modules module-settings module-packages commands; do
+  # shellcheck source=/dev/null
+  source "$SITECTL_LIB/$library.sh"
+done
+
+CONFIG_DIR="/etc/sitectl"
+CONFIG_FILE="$CONFIG_DIR/sitectl.conf"
+SKEL_DIR="$CONFIG_DIR/skel"
+
+# Every nginx config sitectl writes contains this marker. Redeploy and
+# remove refuse to touch configs without it (or the older
+# "created by add-new-site" marker from before the rename).
+CONFIG_MARKER="managed by sitectl"
+
+DRY_RUN="no"
+OUTSIDE_HOME="no"
+
+
+# -----------------------------------------------------------------------------
+#  Help
+# -----------------------------------------------------------------------------
+
+show_usage() {
+  cat <<EOF
+sitectl $SITECTL_VERSION: set up and manage websites on this server
+
+Usage:
+  sudo sitectl add <domain> [options]              Add a site, or redeploy it
+  sudo sitectl add-subdomain <domain> <name> [options]
+                                                   Add <name>.<domain> to <domain>
+  sudo sitectl remove <domain> [--yes]             Remove a site's configs
+  sudo sitectl remove-subdomain <domain> <name>    Remove <name>.<domain>
+  sitectl list [<domain>] [--json]                 List sites (and subdomains)
+  sitectl commands [--json]                        Every command, with the access it needs
+  sitectl help | version
+
+Settings and modules:
+  sudo sitectl config                              Walk through sitectl's own settings
+  sudo sitectl config <module>                     Walk through a module's settings
+  sitectl config show [<module>]                   Show settings (secrets are never shown)
+  sitectl config get <module>.<setting>
+  sudo sitectl config set <module>.<setting> <value>
+  sudo sitectl config set-secret <module>.<setting>  Type it (hidden), or pipe it in
+  sudo sitectl config unset <module>.<setting>
+  sitectl modules                                  List modules (and their versions)
+  sitectl modules info <module>
+  sudo sitectl modules enable|disable <module>
+  sudo sitectl modules install <folder | file.tar.gz>
+  sudo sitectl modules uninstall <module>          Remove an installed module
+  sitectl modules new <name>                       Start a module from the template
+  sitectl modules pack <folder>                    Make an installable .tar.gz
+
+Module commands:
+$(module_commands_help)
+
+Options for add and add-subdomain (each overrides the default in
+$CONFIG_FILE, or the site's current setting when redeploying):
+  --php / --static      PHP site, or plain HTML
+  --www / --no-www      Also answer on www.<domain>, or don't
+  --ssl / --no-ssl      Get a Let's Encrypt certificate, or don't. Without
+                        --ssl, a domain that doesn't reach this server yet
+                        is staged instead (see the steps it prints); --ssl
+                        requests the certificate anyway.
+  --path PATH           Web folder. Relative paths are inside the user's
+                        home (--path www -> /home/<user>/www); absolute
+                        paths are used as they are.
+  --user NAME           Use this site user. An existing site user gets the
+                        domain added to it (e.g. example.net alongside
+                        example.com).
+  --use-existing-user   If the username made from the domain already
+                        exists, add the domain to it instead of asking
+  --separate-user       For a subdomain, give it its own user
+$(module_options_help)
+
+Options for every command that changes things:
+  -y, --yes             Answer yes to "are you sure?" questions
+  -t, --dry-run         Show what would be done, change nothing (no sudo needed)
+
+Every change is logged in $LOG_FILE.
+EOF
+}
+
+
+# -----------------------------------------------------------------------------
+#  Reading the command line
+# -----------------------------------------------------------------------------
+
+# Sets SUBCOMMAND, ARGS (the non-option arguments after it) and the
+# option variables.
+parse_command_line() {
+  # The command is the first word that isn't an option, so options can go
+  # before or after it (sitectl -t sftp add-key ... works too).
+  SUBCOMMAND=""
+
+  ARGS=()
+  SITE_USER=""
+  USE_EXISTING_USER="no"
+  SEPARATE_USER="no"
+  MODULE_OPTIONS=()
+  MAIN_DOMAIN=""
+  ASSUME_YES="no"
+  LIST_FORMAT="table"
+
+  # Empty means "use the default from the settings file".
+  OPTION_TYPE=""
+  OPTION_WWW=""
+  OPTION_SSL=""
+  OPTION_PATH=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --php)               OPTION_TYPE="php" ;;
+      --static)            OPTION_TYPE="static" ;;
+      --www)               OPTION_WWW="yes" ;;
+      --no-www)            OPTION_WWW="no" ;;
+      --ssl)               OPTION_SSL="yes" ;;
+      --no-ssl)            OPTION_SSL="no" ;;
+      --use-existing-user) USE_EXISTING_USER="yes" ;;
+      --separate-user)     SEPARATE_USER="yes" ;;
+      --json)              LIST_FORMAT="json" ;;
+      -y|--yes)            ASSUME_YES="yes" ;;
+      -t|--dry-run)        DRY_RUN="yes" ;;
+      --path|--user)
+        if [[ -z "${2:-}" ]]; then
+          die "$1 needs a value after it"
+        fi
+        case "$1" in
+          --path) OPTION_PATH="$2" ;;
+          --user) SITE_USER="$2" ;;
+        esac
+        shift
+        ;;
+      -h|--help)
+        show_usage
+        exit 0
+        ;;
+      --version)
+        echo "sitectl $SITECTL_VERSION"
+        exit 0
+        ;;
+      --*)
+        # An option an enabled module adds (e.g. sftp's --sftp-key).
+        local owner="${MODULE_OPTION_OWNER[$1]:-}"
+        [[ -n "$owner" ]] || die "unknown option: $1 (see: sitectl help)"
+        if [[ "${MODULE_OPTION_TAKES_VALUE[$1]}" == "yes" ]]; then
+          [[ -n "${2:-}" ]] || die "$1 needs a value after it"
+          MODULE_OPTIONS[$1]="$2"
+          shift
+        else
+          MODULE_OPTIONS[$1]="yes"
+        fi
+        ;;
+      -*)
+        die "unknown option: $1 (see: sitectl help)"
+        ;;
+      *)
+        if [[ -z "$SUBCOMMAND" ]]; then
+          SUBCOMMAND="$1"
+        else
+          ARGS+=("$1")
+        fi
+        ;;
+    esac
+    shift
+  done
+  SUBCOMMAND="${SUBCOMMAND:-help}"
+
+  # Remember whether the username came from --user (rather than being
+  # worked out from the domain later).
+  USER_GIVEN="no"
+  if [[ -n "$SITE_USER" ]]; then
+    USER_GIVEN="yes"
+  fi
+}
+
+# Check a domain name and put it in DOMAIN.
+set_domain() {
+  DOMAIN="${1,,}"   # ,, converts to lowercase
+
+  # Letters, numbers and hyphens, separated by dots.
+  local domain_pattern='^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$'
+  if [[ ! "$DOMAIN" =~ $domain_pattern ]]; then
+    die "'$DOMAIN' doesn't look like a domain"
+  fi
+
+  # www is added automatically, so catch "www.example.com" as a mistake.
+  if [[ "$DOMAIN" == www.* ]]; then
+    die "use the bare domain (${DOMAIN#www.}); www is added automatically"
+  fi
+}
+
+# For add-subdomain and remove-subdomain: <domain> <name> means
+# <name>.<domain>. Sets MAIN_DOMAIN and DOMAIN.
+set_subdomain() {
+  local main="${1,,}" name="${2,,}"
+  set_domain "$main"
+
+  local label='[a-z0-9]([a-z0-9-]*[a-z0-9])?'
+  if [[ ! "$name" =~ ^$label(\.$label)*$ ]]; then
+    die "'$name' isn't a valid subdomain name (e.g. demo, or test.demo)"
+  fi
+  if [[ "$name" == "www" || "$name" == www.* ]]; then
+    die "www is part of the main site; use --www or --no-www when deploying $main"
+  fi
+
+  MAIN_DOMAIN="$main"
+  DOMAIN="$name.$main"
+  if (( ${#DOMAIN} > 253 )); then
+    die "$DOMAIN is too long for a domain name"
+  fi
+}
+
+# Exactly $1 non-option arguments, or explain the usage in $2.
+expect_args() {
+  if (( ${#ARGS[@]} != $1 )); then
+    die "usage: $2"
+  fi
+}
+
+
+# -----------------------------------------------------------------------------
+#  Shared start-up for commands that change things
+# -----------------------------------------------------------------------------
+
+start_change() {
+  # Test mode changes nothing, so it doesn't need sudo.
+  if [[ $EUID -ne 0 && "$DRY_RUN" != "yes" ]]; then
+    die "run this with sudo (or add -t to see what it would do)"
+  fi
+
+  if [[ "$DRY_RUN" == "yes" ]]; then
+    echo "TEST MODE: showing what would happen; nothing will be changed."
+  else
+    take_lock
+    log_change_start "$@"
+  fi
+
+  # Load the settings. On the first run there's no settings file yet, so
+  # walk through creating one, then carry on.
+  if ! load_config; then
+    if ! can_ask; then
+      die "no settings file at $CONFIG_FILE; run 'sudo sitectl config' first"
+    fi
+    echo "No settings file yet at $CONFIG_FILE; let's create one."
+    run_config_wizard
+  fi
+}
+
+# For settings changes, module changes and module commands: needs root
+# (unless testing), takes the lock and starts the change log entry, once.
+begin_change() {
+  if [[ $EUID -ne 0 && "$DRY_RUN" != "yes" ]]; then
+    die "run this with sudo (or add -t to see what it would do)"
+  fi
+  DOMAIN="${DOMAIN:-settings}"     # names the backup folder
+  if [[ "$DRY_RUN" != "yes" && -z "$LOGGED_COMMAND" ]]; then
+    take_lock
+    log_change_start "${ORIGINAL_ARGS[@]}"
+  fi
+}
+
+# When sitectl stops, for any reason: undo a half-finished redeploy, and
+# record how it ended in the change log.
+#
+# Each step runs even if one before it fails, and the original exit
+# status is kept.
+on_exit() {
+  local status=$?
+  restore_after_failed_redeploy "$status" || true
+  if [[ -n "${UNPACKED_DIR:-}" ]]; then
+    remove_unpacked "$UNPACKED_DIR" || true
+  fi
+  log_change_end "$status" || true
+  exit "$status"
+}
+
+
+# -----------------------------------------------------------------------------
+#  Commands
+# -----------------------------------------------------------------------------
+
+# sitectl add / add-subdomain. DOMAIN (and MAIN_DOMAIN for a subdomain)
+# are already set.
+cmd_add() {
+  apply_options
+  set_domain_paths
+
+  check_for_existing_site      # switches to redeploy mode if the site exists
+
+  # A new site might be a subdomain of one already here. (A redeploy
+  # keeps whatever the site already has.) add-subdomain names the main
+  # domain explicitly, and it must exist.
+  if [[ "$REDEPLOY" != "yes" ]]; then
+    if [[ -n "$MAIN_DOMAIN" ]]; then
+      use_main_domain_as_parent
+    else
+      find_parent_site
+    fi
+  fi
+
+  set_user_and_server_names
+  check_prerequisites
+
+  # Decide the user and web folder, and ask any questions.
+  if [[ "$REDEPLOY" == "yes" ]]; then
+    confirm_redeploy    # also warns about PHP files in a static site
+  elif [[ -n "$PARENT_USER" && "$USER_GIVEN" != "yes" ]]; then
+    choose_subdomain_user
+  else
+    choose_user
+  fi
+
+  if [[ "$REDEPLOY" != "yes" ]]; then
+    warn_about_php_files
+  fi
+
+  # Modules check and ask for what they need (e.g. sftp: the public key).
+  run_module_hooks site_preparing
+
+  # Nothing on the server is changed before this point.
+
+  if [[ "$REDEPLOY" == "yes" ]]; then
+    back_up_old_configs
+  fi
+
+  create_user
+  create_private_folder
+  create_web_root
+  copy_skeleton
+  create_php_pool
+  create_nginx_config
+  get_certificate
+  run_module_hooks site_added
+  print_summary
+}
+
+cmd_remove() {
+  apply_options
+  set_domain_paths
+  remove_site
+  run_module_hooks site_removed
+}
+
+main() {
+  ORIGINAL_ARGS=("$@")
+  load_modules           # first: modules add options that the command line may use
+  parse_command_line "$@"
+  authorize_core_command   # root where the command's level needs it (see commands.sh)
+
+  trap on_exit EXIT
+
+  case "$SUBCOMMAND" in
+    add)
+      expect_args 1 "sitectl add <domain> [options]"
+      set_domain "${ARGS[0]}"
+      start_change "$@"
+      cmd_add
+      ;;
+    add-subdomain)
+      expect_args 2 "sitectl add-subdomain <domain> <name>   (e.g. example.com demo)"
+      set_subdomain "${ARGS[0]}" "${ARGS[1]}"
+      start_change "$@"
+      cmd_add
+      ;;
+    remove)
+      expect_args 1 "sitectl remove <domain>"
+      set_domain "${ARGS[0]}"
+      start_change "$@"
+      cmd_remove
+      ;;
+    remove-subdomain)
+      expect_args 2 "sitectl remove-subdomain <domain> <name>"
+      set_subdomain "${ARGS[0]}" "${ARGS[1]}"
+      start_change "$@"
+      cmd_remove
+      ;;
+    list)
+      if (( ${#ARGS[@]} > 1 )); then
+        die "usage: sitectl list [<domain>] [--json]"
+      fi
+      cmd_list "${ARGS[0]:-}"
+      ;;
+    config)
+      cmd_config "${ARGS[@]}"
+      ;;
+    modules)
+      cmd_modules "${ARGS[@]}"
+      ;;
+    commands)
+      cmd_commands
+      ;;
+    help|-h|--help)
+      show_usage
+      ;;
+    version|--version)
+      echo "sitectl $SITECTL_VERSION"
+      ;;
+    *)
+      if is_module_command "$SUBCOMMAND"; then
+        run_module_command "$SUBCOMMAND" "${ARGS[@]}"
+      else
+        die "unknown command: $SUBCOMMAND (see: sitectl help)"
+      fi
+      ;;
+  esac
+}
+
+main "$@"
