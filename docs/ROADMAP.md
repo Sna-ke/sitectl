@@ -1,14 +1,22 @@
 # sitectl: status, decisions and what's next
 
-This file carries the project from one working session to the next. To
-start a new session, give it:
+This file carries the project from one working session to the next.
+The code lives in the GitHub repository `Sna-ke/sitectl`. To start a new
+session:
 
-1. the latest `sitectl-<version>.tar.gz`
-2. this file, `ARCHITECTURE.md` and `MODULES.md` (all in `docs/`)
-3. the request
+1. give it the repository, with push access
+2. point it at this file, `ARCHITECTURE.md` and `MODULES.md`, plus any
+   design notes for the work at hand (`DESIGN-0.4.md` for 0.4), all in
+   `docs/`
+3. give it the request
 
 Then ask it to read the docs and the relevant code before changing
 anything.
+
+Work happens one branch and one pull request per piece of work, so each
+change is reviewed before it's merged. Commit messages say what changed
+and why. The tests run in the session's own disposable container (see
+"Development notes").
 
 
 ## Where this is going
@@ -159,7 +167,12 @@ panel. Whichever option wins, the same groundwork applies:
 
 ## Next work, in order
 
-1. **Web server as a provider; certificate rework.**
+1. **Web server as a provider; certificate rework.** The open questions
+   are answered in [DESIGN-0.4.md](DESIGN-0.4.md): where ACME challenge
+   files go, renewal reloads, migrating existing certificates, TLS
+   settings, marker comments, and Apache's PHP. It also covers two bugs
+   folded into this work: duplicate pools when a second PHP version is
+   installed, and `open_basedir` missing web folders outside the home.
    - Don't hard-code nginx: nginx first, Apache next.
    - A core interface along the lines of `webserver_write_site`,
      `webserver_test`, `webserver_reload`, `webserver_read_site` and
@@ -245,7 +258,22 @@ panel. Whichever option wins, the same groundwork applies:
   - no `column` command (`align_columns` uses awk)
   - a pip-installed `cryptography` that broke the system certbot (run
     the tests with `CERTBOT_REAL` pointing at a wrapper that sets
-    `PYTHONPATH=/usr/lib/python3/dist-packages`)
+    `PYTHONPATH=/usr/lib/python3/dist-packages`). Where `/usr/bin/python3`
+    isn't Ubuntu's own Python, the wrapper also has to name it:
+
+    ```sh
+    #!/bin/sh
+    PYTHONPATH=/usr/lib/python3/dist-packages exec /usr/bin/python3.12 -s /usr/bin/certbot "$@"
+    ```
+
+  - no IPv6 at all, while Ubuntu's stock default site listens on
+    `[::]:80`, so every `nginx -t` fails. Comment that line out in
+    `/etc/nginx/sites-available/default` on the test machine (sitectl's
+    own configs already leave IPv6 out there).
+  - scripts losing their executable bit when files are uploaded through
+    GitHub's web page. Keep the modes in git
+    (`git add --chmod=+x <file>`) for `bin/sitectl`, the tests, their
+    shims, `install.sh`, `uninstall.sh` and `tools/release.sh`.
   - a daemon started during a run kept the lock's file descriptor open
     (fixed: `run` and `systemctl` close fd 9)
 - **Bash pitfalls already hit:**
