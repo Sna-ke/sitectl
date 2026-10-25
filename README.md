@@ -15,8 +15,8 @@ Version 0.3.0. Formerly the single script `add-new-site`; sites made with
 that are picked up automatically.
 
 More in [`docs/`](docs/): [how sitectl works](docs/ARCHITECTURE.md),
-[writing modules](docs/MODULES.md), and [status and what's
-next](docs/ROADMAP.md).
+[writing modules](docs/MODULES.md), [status and what's
+next](docs/ROADMAP.md), and [the 0.4 design](docs/DESIGN-0.4.md).
 
 
 ## Installing
